@@ -37,11 +37,18 @@ class BoundMaxPool(BoundOptimizableActivation):
         self.use_default_ibp = True
         self.alpha = {}
         self.init = {}
+        # use this attribute to select the relaxation mode
+        # 'original_abcrown' - the original code in this file
+        # 'deeppoly' - my refactorization of the original code
+        # 'xiao2024' - xiao2024 relaxation (own implementation using formula in the paper)
+        # 'xiao2024_original' - xiao2024 relaxation (using their implementation for auto_LiRPA -> https://github.com/xiaoyuanpigo/maxlin/blob/15909427c2ac643010124604e78f703b915e0c72/auto_lirpa_maxlin.py#L230)
+        self.relax_mode = options['maxpool_relaxation']
 
     def forward(self, x):
         output, _ = F.max_pool2d(x, self.kernel_size, self.stride, self.padding,
                                  return_indices=True, ceil_mode=self.ceil_mode)
         return output
+    
     def deeppoly_lower(self, ls, us, shape):
         max_lower, max_lower_index = F.max_pool2d(ls, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
         
@@ -262,42 +269,70 @@ class BoundMaxPool(BoundOptimizableActivation):
         batch_size = x.lower.shape[0]
         shape = list(shape[:-2]) + [a + 2*b for a, b in zip(self.input_shape[-2:], self.padding)]
         shape[0] = batch_size
-        # Lower and upper D matrices. They have size (batch_size, input_c, x, y) which will be multiplied on enlarges the A matrices via F.interpolate.
-        upper_d = torch.zeros(shape, device=x.device)
-        lower_d = None
 
-        # Size of upper_b and lower_b: (batch_size, output_c, h, w).
-        upper_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
-        lower_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
+        if self.relax_mode == 'original_abcrown':
+            # Lower and upper D matrices. They have size (batch_size, input_c, x, y) which will be multiplied on enlarges the A matrices via F.interpolate.
+            upper_d = torch.zeros(shape, device=x.device)
+            lower_d = None
 
-        # Find the maxpool neuron whose input bounds satisfy l_i > max_j u_j for all j != i. In this case, the maxpool neuron is linear, and we can set upper_d = lower_d = 1.
-        # We first find which indices has the largest lower bound.
-        max_lower, max_lower_index = F.max_pool2d(
-            x.lower, self.kernel_size, self.stride, self.padding,
-            return_indices=True, ceil_mode=self.ceil_mode)
-        # Set the upper bound of the i-th input to -inf so it will not be selected as the max.
+            # Size of upper_b and lower_b: (batch_size, output_c, h, w).
+            upper_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
+            lower_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
 
-        if paddings == (0,0,0,0):
-            delete_upper = torch.scatter(
-                torch.flatten(x.upper, -2), -1,
-                torch.flatten(max_lower_index, -2), -torch.inf).view(upper_d.shape)
-        else:
-            delete_upper = torch.scatter(
-                torch.flatten(F.pad(x.upper, paddings), -2), -1,
+            # Find the maxpool neuron whose input bounds satisfy l_i > max_j u_j for all j != i. In this case, the maxpool neuron is linear, and we can set upper_d = lower_d = 1.
+            # We first find which indices has the largest lower bound.
+            max_lower, max_lower_index = F.max_pool2d(
+                x.lower, self.kernel_size, self.stride, self.padding,
+                return_indices=True, ceil_mode=self.ceil_mode)
+            # Set the upper bound of the i-th input to -inf so it will not be selected as the max.
+
+            if paddings == (0,0,0,0):
+                delete_upper = torch.scatter(
+                    torch.flatten(x.upper, -2), -1,
+                    torch.flatten(max_lower_index, -2), -torch.inf).view(upper_d.shape)
+            else:
+                delete_upper = torch.scatter(
+                    torch.flatten(F.pad(x.upper, paddings), -2), -1,
+                    torch.flatten(max_lower_index, -2),
+                    -torch.inf).view(upper_d.shape)
+            # Find the the max upper bound over the remaining ones.
+            max_upper, _ = F.max_pool2d(
+                delete_upper, self.kernel_size, self.stride, 0,
+                return_indices=True, ceil_mode=self.ceil_mode)
+
+            # The upper bound slope for maxpool is either 1 on input satisfies l_i > max_j u_j (linear), or 0 everywhere. Upper bound is not optimized.
+            values = torch.zeros_like(max_lower)
+            values[max_lower >= max_upper] = 1.0
+            upper_d = torch.scatter(
+                torch.flatten(upper_d, -2), -1,
                 torch.flatten(max_lower_index, -2),
-                -torch.inf).view(upper_d.shape)
-        # Find the the max upper bound over the remaining ones.
-        max_upper, _ = F.max_pool2d(
-            delete_upper, self.kernel_size, self.stride, 0,
-            return_indices=True, ceil_mode=self.ceil_mode)
+                torch.flatten(values, -2)).view(upper_d.shape)
+            
 
-        # The upper bound slope for maxpool is either 1 on input satisfies l_i > max_j u_j (linear), or 0 everywhere. Upper bound is not optimized.
-        values = torch.zeros_like(max_lower)
-        values[max_lower >= max_upper] = 1.0
-        upper_d = torch.scatter(
-            torch.flatten(upper_d, -2), -1,
-            torch.flatten(max_lower_index, -2),
-            torch.flatten(values, -2)).view(upper_d.shape)
+            # can we just put that here?
+            # For the upper bound, we set the bias term to concrete upper bounds for maxpool neurons that are not linear.
+            max_upper_, _ = F.max_pool2d(x.upper, self.kernel_size, self.stride,
+                                        self.padding, return_indices=True,
+                                        ceil_mode=self.ceil_mode)
+            upper_b[max_upper > max_lower] = max_upper_[max_upper > max_lower]
+
+        elif self.relax_mode == 'deeppoly':
+            # need to define lower_b here becaues this branch is executed every time, while below, we only execute self.deeppoly_lower
+            # at initialization and use the values stored in alpha in the following iterations (so no lower_b will be available)
+            # TODO: just use torch.zeros() instead of calling self.deeppoly_lower to get the lower bias (it is always zero anyways)?
+            #_, lower_b = self.deeppoly_lower(x.lower, x.upper, self.output_shape)
+            lower_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
+            upper_d, upper_b = self.deeppoly_upper(x.lower, x.upper, shape)
+        elif self.relax_mode == 'xiao2024':
+            # see above in self.relax_mode == 'deeppoly' why we need to define lower_b here
+            lower_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
+            upper_d, upper_b = self.xiao2024_upper(x.lower, x.upper, shape)
+        elif self.relax_mode == 'xiao2024_original':
+            lower_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
+            upper_d, upper_b = self.xiao2024_upper_original(x.lower, x.upper, shape)
+        else:
+            raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original")
+
 
         if self.opt_stage == 'opt':
             if unstable_idx is not None and self.alpha[start_node.name].size(1) != 1:
@@ -317,11 +352,21 @@ class BoundMaxPool(BoundOptimizableActivation):
                 alpha = self.alpha[start_node.name]
 
             if not self.init[start_node.name]:
-                lower_d = torch.zeros((shape), device=x.device)
-                # [batch, C, H, W]
-                lower_d = torch.scatter(
-                    torch.flatten(lower_d, -2), -1,
-                    torch.flatten(max_lower_index, -2), 1.0).view(upper_d.shape)
+                if self.relax_mode == 'original_abcrown':
+                    lower_d = torch.zeros((shape), device=x.device)
+                    # [batch, C, H, W]
+                    lower_d = torch.scatter(
+                        torch.flatten(lower_d, -2), -1,
+                        torch.flatten(max_lower_index, -2), 1.0).view(upper_d.shape)
+                elif self.relax_mode == 'deeppoly':
+                    lower_d, lower_b = self.deeppoly_lower(x.lower, x.upper, shape)
+                elif self.relax_mode == 'xiao2024':
+                    lower_d, lower_b = self.xiao2024_lower(x.lower, x.upper, shape)
+                elif self.relax_mode == 'xiao2024_original':
+                    lower_d, lower_b = self.xiao2024_lower_original(x.lower, x.upper, shape)
+                else:
+                    raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original")
+                
                 # shape [batch, C*k*k, L]
                 lower_d_unfold = F.unfold(
                     lower_d, self.kernel_size, 1, stride=self.stride)
@@ -351,20 +396,25 @@ class BoundMaxPool(BoundOptimizableActivation):
                                    alpha_shape[2], *lower_d.shape[1:])
             lower_d = lower_d.squeeze(0)
         else:
-            lower_d = torch.zeros((shape), device=x.device)
-            # Not optimizable bounds. We simply set \hat{z} >= z_i where i is the input element with largest lower bound.
-            lower_d = torch.scatter(torch.flatten(lower_d, -2), -1,
-                                    torch.flatten(max_lower_index, -2),
-                                    1.0).view(upper_d.shape)
+            if self.relax_mode == 'original_abcrown':
+                lower_d = torch.zeros((shape), device=x.device)
+                # [batch, C, H, W]
+                lower_d = torch.scatter(
+                    torch.flatten(lower_d, -2), -1,
+                    torch.flatten(max_lower_index, -2), 1.0).view(upper_d.shape)
+            elif self.relax_mode == 'deeppoly':
+                lower_d, lower_b = self.deeppoly_lower(x.lower, x.upper, shape)
+            elif self.relax_mode == 'xiao2024':
+                lower_d, lower_b = self.xiao2024_lower(x.lower, x.upper, shape)
+            elif self.relax_mode == 'xiao2024_original':
+                lower_d, lower_b = self.xiao2024_lower_original(x.lower, x.upper, shape)
+            else:
+                raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original")
+
             if self.padding[0] > 0 or self.padding[1] > 0:
                 lower_d = lower_d[...,self.padding[0]:-self.padding[0],
                                   self.padding[1]:-self.padding[1]]
 
-        # For the upper bound, we set the bias term to concrete upper bounds for maxpool neurons that are not linear.
-        max_upper_, _ = F.max_pool2d(x.upper, self.kernel_size, self.stride,
-                                     self.padding, return_indices=True,
-                                     ceil_mode=self.ceil_mode)
-        upper_b[max_upper > max_lower] = max_upper_[max_upper > max_lower]
 
         def _bound_oneside(last_A, d_pos, d_neg, b_pos, b_neg):
             if last_A is None:
