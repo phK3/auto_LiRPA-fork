@@ -95,6 +95,7 @@ class BoundedModule(nn.Module):
             'use_full_conv_alpha_thresh': 512,
             'verbosity': 1 if verbose else 0,
             'optimize_graph': {'optimizer': None},
+            'maxpool_relaxation': 'original_abcrown',
         }
         default_bound_opts.update(bound_opts)
         self.bound_opts = default_bound_opts
