@@ -123,11 +123,8 @@ class BoundMaxPool(BoundOptimizableActivation):
         values = ub_slope.clone()  
         # if fixed, then slope is 1
         values[lval >= u2] = 1.
-        # if ifxed, then use slope 1 at these indices, else use ub_slope at other indices
-        #inds = torch.where(lval >= u2, lind, u1ind)
 
         upper_d = torch.zeros(shape, device=us.device)
-        #upper_d = torch.scatter(upper_d.flatten(-2), -1, inds.flatten(-2), values.flatten(-2)).view(shape)       
         upper_d = torch.scatter(upper_d.flatten(-2), -1, u1ind.flatten(-2), values.flatten(-2)).view(shape)       
 
         return upper_d, upper_b
