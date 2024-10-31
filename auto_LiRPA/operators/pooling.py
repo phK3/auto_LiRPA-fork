@@ -42,6 +42,39 @@ class BoundMaxPool(BoundOptimizableActivation):
         output, _ = F.max_pool2d(x, self.kernel_size, self.stride, self.padding,
                                  return_indices=True, ceil_mode=self.ceil_mode)
         return output
+    def deeppoly_lower(self, ls, us, shape):
+        max_lower, max_lower_index = F.max_pool2d(ls, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
+        
+        lower_b = torch.zeros(ls.shape[0], *self.output_shape[1:], device=ls.device)
+        
+        lower_d = torch.zeros(shape, device=ls.device)
+        # set \hat{z} >= z_i where i is the input element with largest lower bound.
+        lower_d = torch.scatter(lower_d.flatten(-2), -1,
+                                max_lower_index.flatten(-2), 1.0)
+        lower_d = lower_d.view(shape)
+        
+        return lower_d, lower_b
+    
+    def deeppoly_upper(self, ls, us, shape):
+        max_lower, max_lower_index = F.max_pool2d(ls, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
+        max_upper, max_upper_index = F.max_pool2d(us, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
+
+        # find largest upper bound that does not belong to the same entry as max_lower (respecting stride and padding)
+        padding = tuple((self.padding[0], self.padding[0], self.padding[1], self.padding[1]))
+        remaining_upper = torch.scatter(F.pad(us, padding).flatten(-2), -1, max_lower_index.flatten(-2), -torch.inf).view(us.shape)
+        max_upper_remaining, max_upper_index_remaining = F.max_pool2d(remaining_upper, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
+
+        values = torch.zeros_like(max_lower, device=us.device)
+        values[max_lower >= max_upper_remaining] = 1.
+
+        upper_d = torch.zeros(shape, device=us.device)
+        upper_d = torch.scatter(upper_d.flatten(-2), -1, max_lower_index.flatten(-2), values.flatten(-2)).view(shape)
+        
+        # when we are fixed (i.e. l_i >= second largest upper bound, then bias = 0, else bias = u_i)
+        upper_b = torch.where(max_lower >= max_upper_remaining, 0., max_upper)
+        upper_b = upper_b.view(shape[0], *self.output_shape[1:])
+        
+        return upper_d, upper_b
 
     def project_simplex(self, patches):
         sorted = torch.flatten(patches, -2)
