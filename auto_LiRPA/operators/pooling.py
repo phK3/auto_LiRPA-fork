@@ -76,6 +76,148 @@ class BoundMaxPool(BoundOptimizableActivation):
         
         return upper_d, upper_b
 
+    def xiao2024_lower(self, ls, us, shape):
+        ms = 0.5 * (ls + us)
+
+        mval, mind = F.max_pool2d(ms, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
+        
+        # lower coefficients
+        lower_d = torch.zeros(shape, device=ls.device)
+        lower_d = torch.scatter(lower_d.flatten(-2), -1, mind.flatten(-2), 1)
+        lower_d = lower_d.view(shape)
+        
+        lower_b = torch.zeros(ls.shape[0], *self.output_shape[1:], device=ls.device)
+        
+        return lower_d, lower_b
+    
+    def xiao2024_upper(self, ls, us, shape):       
+        lval, lind = F.max_pool2d(ls, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
+
+        # find largest, second largest and third largest concrete upper bound (while respecting stride and padding)
+        padding = tuple((self.padding[0], self.padding[0], self.padding[1], self.padding[1]))
+        # find largest entry
+        u1, u1ind = F.max_pool2d(us, self.kernel_size, self.stride, self.padding, ceil_mode=self.ceil_mode, return_indices=True)
+        # add padding to us and set largest entry to -inf so it is not picked again
+        us2 = torch.scatter(F.pad(us, padding).flatten(-2), -1, u1ind.flatten(-2), -torch.inf).view(us.shape)
+        # find 2nd-largest entry (but without padding, since we explicitly added the padding above)
+        u2, u2ind = F.max_pool2d(us2, self.kernel_size, self.stride, 0, ceil_mode=self.ceil_mode, return_indices=True)
+
+        l_i = ls.flatten(-2).gather(-1, u1ind.flatten(-2)).view(u1.shape)
+
+        ub_slope = (u1 - u2) / (u1 - l_i)
+
+        # bias terms
+        upper_b = -l_i * ub_slope + u2
+        upper_b = torch.where((lval >= u2) & (l_i >= lval), 0., upper_b)
+        upper_b = upper_b.view(us.shape[0], *self.output_shape[1:])
+
+        # coefficients
+        # need .clone(), otherwise values[..] = 1. would be an inplace operation which is bad for autodiff (see https://discuss.pytorch.org/t/what-is-in-place-operation/16244/15)
+        values = ub_slope.clone()  
+        # if fixed, then slope is 1
+        values[lval >= u2] = 1.
+        # if ifxed, then use slope 1 at these indices, else use ub_slope at other indices
+        #inds = torch.where(lval >= u2, lind, u1ind)
+
+        upper_d = torch.zeros(shape, device=us.device)
+        #upper_d = torch.scatter(upper_d.flatten(-2), -1, inds.flatten(-2), values.flatten(-2)).view(shape)       
+        upper_d = torch.scatter(upper_d.flatten(-2), -1, u1ind.flatten(-2), values.flatten(-2)).view(shape)       
+
+        return upper_d, upper_b
+    
+    def xiao2024_lower_original(self, ls, us, shape):
+        middle=(ls + us)/2
+        max_m, max_m_index = F.max_pool2d(
+            middle, self.kernel_size, self.stride, self.padding,
+            return_indices=True, ceil_mode=self.ceil_mode)
+        
+        #lower_bound
+        lower_d = torch.zeros((shape), device=ls.device)
+        lower_d = torch.scatter(torch.flatten(lower_d, -2), -1,
+                                torch.flatten(max_m_index, -2),
+                                1.0).view(shape)
+        if self.padding[0] > 0 or self.padding[1] > 0:
+            lower_d = lower_d[...,self.padding[0]:-self.padding[0],
+                            self.padding[1]:-self.padding[1]]
+            
+        lower_b = torch.zeros(shape[0], *self.output_shape[1:], device=ls.device)
+
+        return lower_d, lower_b
+
+    def xiao2024_upper_original(self, ls, us, shape):
+        upper_d = torch.zeros(shape, device=us.device)
+        upper_b = torch.zeros(shape[0], *self.output_shape[1:], device=us.device)
+
+        max_lower, max_lower_index = F.max_pool2d(
+            ls, self.kernel_size, self.stride, self.padding,
+            return_indices=True, ceil_mode=self.ceil_mode)
+
+        max_upper, max_upper_index = F.max_pool2d(
+            us, self.kernel_size, self.stride, self.padding,
+            return_indices=True, ceil_mode=self.ceil_mode)
+        
+        paddings = tuple((self.padding[0], self.padding[0], self.padding[1], self.padding[1]))
+        if paddings == (0,0,0,0):
+            delete_upper = torch.scatter(
+                torch.flatten(us, -2), -1,
+                torch.flatten(max_upper_index, -2), -torch.inf).view(upper_d.shape)
+        else:
+            delete_upper = torch.scatter(
+                torch.flatten(F.pad(us, paddings), -2), -1,
+                torch.flatten(max_upper_index, -2),
+                -torch.inf).view(upper_d.shape)
+
+        # Find the the second max upper bound 
+        max_upper2, max_upper2_index = F.max_pool2d(
+            delete_upper, self.kernel_size, self.stride, 0,
+            return_indices=True, ceil_mode=self.ceil_mode)
+        
+
+        if paddings == (0,0,0,0):
+            scatter_ = torch.scatter(
+                torch.flatten(torch.zeros(shape, device=us.device), -2), -1,
+                torch.flatten(max_upper_index, -2),
+                1.0).view(upper_d.shape)
+            max_upper_lower= torch.where(scatter_!=0,ls, -torch.inf)
+            scatter_deviation = torch.where(scatter_!=0,us-ls,0)
+            scatter_deviation2 = torch.where(scatter_!=0,1.0/(us - ls),0)
+        else:
+            scatter_ = torch.scatter(
+                torch.flatten(F.pad(torch.zeros(shape, device=us.device), paddings), -2), -1,
+                torch.flatten(max_upper_index, -2),
+                1.0).view(upper_d.shape)
+            max_upper_lower=torch.where(scatter_!=0,ls, -torch.inf)
+            scatter_deviation = torch.where(scatter_!=0,us - ls,0)
+            scatter_deviation2 = torch.where(scatter_!=0,1.0/(us - ls),0)
+        deviation,_=F.max_pool2d(
+            scatter_deviation, self.kernel_size, self.stride, 0,
+            return_indices=True, ceil_mode=self.ceil_mode)
+        max_upper_lower,_=F.max_pool2d(
+            max_upper_lower, self.kernel_size, self.stride, 0,
+            return_indices=True, ceil_mode=self.ceil_mode)
+
+        deviation2,_=F.max_pool2d(
+            scatter_deviation2, self.kernel_size, self.stride, 0,
+            return_indices=True, ceil_mode=self.ceil_mode)
+
+        values = torch.zeros_like(max_lower)
+        values[max_lower >= max_upper2] = 1.0
+        temp=(max_upper-max_upper2)/deviation
+        values[max_lower < max_upper2]=temp[max_lower < max_upper2]
+        values[max_upper_lower < max_lower]=temp[max_upper_lower < max_lower]
+        
+        upper_d = torch.scatter(
+            torch.flatten(upper_d, -2), -1,
+            torch.flatten(max_upper_index, -2),
+            torch.flatten(values, -2)).view(upper_d.shape)
+
+        b=-(max_upper-max_upper2)*deviation2*max_upper_lower+max_upper2#-max_lower
+        upper_b[max_upper2 > max_lower]=b[max_upper2 > max_lower]  
+        upper_b[max_upper_lower < max_lower]=b[max_upper_lower < max_lower]
+
+        return upper_d, upper_b
+
+
     def project_simplex(self, patches):
         sorted = torch.flatten(patches, -2)
         sorted, _ = torch.sort(sorted, -1, descending=True)
