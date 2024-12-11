@@ -110,11 +110,13 @@ class BatchedGurobiMaxPoolLP(torch.autograd.Function):
                     # solve under constraint that j is max
                     if u_np[j] < np.max(l_np):
                         # x_j cannot be max
+                        # but there is always one x_i that is max, so the lists always
+                        # have >= 1 entry
                         continue
                     
                     # Set up the Gurobi model
                     model = grb.Model('model', env)
-                    # by default gurobi vars are >= 0, no need to add lower bound!!!
+                    # by default gurobi vars are >= 0, so need to add lower bound!!!
                     x = model.addMVar(shape=n_vars, lb=l_np, ub=u_np)
 
                     # Set objective
