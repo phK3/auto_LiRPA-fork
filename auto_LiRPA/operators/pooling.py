@@ -20,6 +20,7 @@ from .base import *
 from .activation_base import BoundOptimizableActivation
 import numpy as np
 from .solver_utils import grb
+from .gurobi_maxpool_lp import compute_maxpool_bias
 
 
 class BoundMaxPool(BoundOptimizableActivation):
@@ -42,6 +43,7 @@ class BoundMaxPool(BoundOptimizableActivation):
         # 'deeppoly' - my refactorization of the original code
         # 'xiao2024' - xiao2024 relaxation (own implementation using formula in the paper)
         # 'xiao2024_original' - xiao2024 relaxation (using their implementation for auto_LiRPA -> https://github.com/xiaoyuanpigo/maxlin/blob/15909427c2ac643010124604e78f703b915e0c72/auto_lirpa_maxlin.py#L230)
+        # 'gurobi_lp' - optimizable upper bound via differentiable LP
         self.relax_mode = options['maxpool_relaxation']
 
     def forward(self, x):
@@ -240,9 +242,18 @@ class BoundMaxPool(BoundOptimizableActivation):
         if name_start == '_forward':
             warnings.warn("MaxPool's optimization is not supported for forward mode")
             return None
+
         ref = self.inputs[0].lower # a reference variable for getting the shape
+
+        if self.relax_mode == 'gurobi_lp':
+            # lower and upper relaxation are optimizable
+            n_params = 2
+        else:
+            # originally, only the lower relaxation is optimized
+            n_params = 1
+
         alpha = torch.empty(
-            [1, size_spec, self.input_shape[0], self.input_shape[1],
+            [n_params, size_spec, self.input_shape[0], self.input_shape[1],
             self.output_shape[-2], self.output_shape[-1],
             self.kernel_size[0], self.kernel_size[1]],
             dtype=torch.float, device=ref.device, requires_grad=True)
@@ -327,8 +338,11 @@ class BoundMaxPool(BoundOptimizableActivation):
         elif self.relax_mode == 'xiao2024_original':
             lower_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
             upper_d, upper_b = self.xiao2024_upper_original(x.lower, x.upper, shape)
+        elif self.relax_mode == 'gurobi_lp':
+            # still need lower bound of zero, just as in deeppoly or original_abcrown case, since we use their relaxation for the lower bound
+            lower_b = torch.zeros(batch_size, *self.output_shape[1:], device=x.device)
         else:
-            raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original")
+            raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original, gurobi_lp")
 
 
         if self.opt_stage == 'opt':
@@ -337,16 +351,34 @@ class BoundMaxPool(BoundOptimizableActivation):
                     raise NotImplementedError('Please use --conv_mode matrix')
                 elif unstable_idx.ndim == 1:
                     # Only unstable neurons of the start_node neurons are used.
-                    alpha = self.non_deter_index_select(
-                        self.alpha[start_node.name], index=unstable_idx, dim=1)
+                    if self.relax_mode == 'gurobi_lp':
+                        # use self.alpha[][:1] instead of self.alpha[][0] to retain ndims in shape
+                        alpha = self.non_deter_index_select(
+                            self.alpha[start_node.name][:1], index=unstable_idx, dim=1)
+                        alpha_u = self.non_deter_index_select(
+                            self.alpha[start_node.name][1:], index=unstable_idx, dim=1)
+                    else:
+                        alpha = self.non_deter_index_select(
+                            self.alpha[start_node.name], index=unstable_idx, dim=1)
                 elif unstable_idx.ndim == 2:
                     # Each element in the batch selects different neurons.
-                    alpha = batched_index_select(
-                        self.alpha[start_node.name], index=unstable_idx, dim=1)
+                    if self.relax_mode == 'gurobi_lp':
+                        alpha = batched_index_select(
+                            self.alpha[start_node.name][:1], index=unstable_idx, dim=1)
+                        alpha_u = batched_index_select(
+                            self.alpha[start_node.name][1:], index=unstable_idx, dim=1)
+                    else:
+                        alpha = batched_index_select(
+                            self.alpha[start_node.name], index=unstable_idx, dim=1)
                 else:
                     raise ValueError
             else:
-                alpha = self.alpha[start_node.name]
+                if self.relax_mode == 'gurobi_lp':
+                    # TODO: rename all alpha to alpha_l
+                    alpha = self.alpha[start_node.name][:1]
+                    alpha_u = self.alpha[start_node.name][1:]
+                else:
+                    alpha = self.alpha[start_node.name]
 
             if not self.init[start_node.name]:
                 if self.relax_mode == 'original_abcrown':
@@ -361,8 +393,12 @@ class BoundMaxPool(BoundOptimizableActivation):
                     lower_d, lower_b = self.xiao2024_lower(x.lower, x.upper, shape)
                 elif self.relax_mode == 'xiao2024_original':
                     lower_d, lower_b = self.xiao2024_lower_original(x.lower, x.upper, shape)
+                elif self.relax_mode == 'gurobi_lp':
+                    # use some method for initialization
+                    lower_d, lower_b = self.xiao2024_lower_original(x.lower, x.upper, shape)
+                    upper_d, upper_b = self.xiao2024_upper_original(x.lower, x.upper, shape)
                 else:
-                    raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original")
+                    raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original, gurobi_lp")
                 
                 # shape [batch, C*k*k, L]
                 lower_d_unfold = F.unfold(
@@ -375,11 +411,33 @@ class BoundMaxPool(BoundOptimizableActivation):
 
                 # [batch, C, out_H, out_W, k, k]
                 alpha.data.copy_(alpha_data.permute((0,1,4,5,2,3)).clone().detach())
-                self.init[start_node.name] = True
                 # In optimization mode, we use the same lower_d once builded.
                 if self.padding[0] > 0 or self.padding[1] > 0:
                     lower_d = lower_d[...,self.padding[0]:-self.padding[0],
                                       self.padding[1]:-self.padding[1]]
+                    
+                if self.relax_mode == 'gurobi_lp':
+                    # now also need to init upper relaxation
+                    # just copy what abCROWN people did for lower relaxation
+
+                    # shape [batch, C*k*k, L]
+                    upper_d_unfold = F.unfold(
+                        upper_d, self.kernel_size, 1, stride=self.stride)
+
+                    # [batch, C, k, k, out_H, out_W]
+                    alpha_u_data = upper_d_unfold.view(
+                        upper_d.shape[0], upper_d.shape[1], self.kernel_size[0],
+                        self.kernel_size[1], self.output_shape[-2], self.output_shape[-1])
+
+                    # [batch, C, out_H, out_W, k, k]
+                    alpha_u.data.copy_(alpha_u_data.permute((0,1,4,5,2,3)).clone().detach())
+                    # In optimization mode, we use the same upper_d once builded.
+                    if self.padding[0] > 0 or self.padding[1] > 0:
+                        upper_d = upper_d[...,self.padding[0]:-self.padding[0],
+                                        self.padding[1]:-self.padding[1]]
+                        
+                self.init[start_node.name] = True
+
             # The lower bound coefficients must be positive and projected to an unit simplex.
             alpha.data = self.project_simplex(alpha.data).clone().detach()  # TODO: don't do this, never re-assign the .data property. Use copy_ instead.
             # permute the last 6 dimensions of alpha to [batch, C, k, k, out_H, out_W], which prepares for the unfold operation.
@@ -392,6 +450,45 @@ class BoundMaxPool(BoundOptimizableActivation):
             lower_d = lower_d.view(alpha_shape[0], alpha_shape[1],
                                    alpha_shape[2], *lower_d.shape[1:])
             lower_d = lower_d.squeeze(0)
+
+            if self.relax_mode == 'gurobi_lp':
+                # we don't need to change alpha_u, as all we do is compute the bias in GurobiLP
+                # permute the last 6 dimensions of alpha to [batch, C, k, k, out_H, out_W], which prepares for the unfold operation.
+                alpha_u = alpha_u.permute((0,1,2,3,6,7,4,5))
+                alpha_u_shape = alpha_u.shape
+                alpha_u = alpha_u.reshape((alpha_u_shape[0]*alpha_u_shape[1]*alpha_u_shape[2],
+                                    -1, alpha_u_shape[-2]*alpha_u_shape[-1]))
+                upper_d = F.fold(alpha_u, self.input_shape[-2:], self.kernel_size, 1,
+                                self.padding, self.stride)
+                upper_d = upper_d.view(alpha_u_shape[0], alpha_u_shape[1],
+                                    alpha_u_shape[2], *upper_d.shape[1:])
+                upper_d = upper_d.squeeze(0)
+
+                # TODO: check if correct - do we only need to look at unfolded lower and upper bounds?
+                # we only look at unfolded bounds: 
+                # - if we have 3x3 input and kernel size 2x2 and no padding, we only look at the first 2x2 inputs
+                #   the other inputs are irrelevant
+                # - just execute a = torch.arange(18, dtype=torch.float32), F.unfold(a, (2, 2), 1, stride=2) to check
+                #upper_b = compute_maxpool_bias(x.lower, x.upper, upper_d)
+                # shape [batch, C*k*k, L]
+                lower_unfold = F.unfold(x.lower, self.kernel_size, 1, stride=self.stride)
+                upper_unfold = F.unfold(x.upper, self.kernel_size, 1, stride=self.stride)
+                # upper_d also has spec_size dimension 
+                # reshape to (spec*batch, out_channels, in[0], in[1])
+                upper_d_reshape = upper_d.view(upper_d.shape[0]*upper_d.shape[1], -1, upper_d.shape[-2], upper_d.shape[-1])
+                upper_d_unfold = F.unfold(upper_d_reshape, self.kernel_size, 1, stride=self.stride)
+                # if we want to use compute_maxpool_bias, we need one set of lower and upper bounds for each set of coefficients
+                # but if the coefficients tensor has an additional spec-dim (and the lower and upper bounds have not),
+                # then we need to repeat the bounds tensors to match the number of elements
+                lower_unfold = lower_unfold.repeat(upper_d_unfold.shape[0], *[1] * (lower_unfold.dim() - 1))
+                upper_unfold = upper_unfold.repeat(upper_d_unfold.shape[0], *[1] * (upper_unfold.dim() - 1))
+                lower_unfold = lower_unfold.view(batch_size, -1, self.kernel_size[0], self.kernel_size[1]) 
+                upper_unfold = upper_unfold.view(batch_size, -1, self.kernel_size[0], self.kernel_size[1]) 
+                upper_d_unfold = upper_d_unfold.view(batch_size, -1, self.kernel_size[0], self.kernel_size[1])               
+                upper_b = compute_maxpool_bias(lower_unfold, upper_unfold, upper_d_unfold)
+                # reshape to (spec_size, batch_size, ...)
+                upper_b = upper_b.view(upper_d.shape[0], batch_size, *self.output_shape[1:])
+
         else:
             if self.relax_mode == 'original_abcrown':
                 lower_d = torch.zeros((shape), device=x.device)
@@ -405,12 +502,22 @@ class BoundMaxPool(BoundOptimizableActivation):
                 lower_d, lower_b = self.xiao2024_lower(x.lower, x.upper, shape)
             elif self.relax_mode == 'xiao2024_original':
                 lower_d, lower_b = self.xiao2024_lower_original(x.lower, x.upper, shape)
+            elif self.relax_mode == 'gurobi_lp':
+                # why is this executed even if we set alpha-crown and not only crown as method?
+                # use some method for initialization
+                lower_d, lower_b = self.xiao2024_lower_original(x.lower, x.upper, shape)
+                upper_d, upper_b = self.xiao2024_upper_original(x.lower, x.upper, shape)
             else:
                 raise ValueError(f"self.relax_mode = {self.relax_mode} not supported! Choose from original_abcrown, deeppoly, xiao2024, xiao2024_original")
 
             if self.padding[0] > 0 or self.padding[1] > 0:
                 lower_d = lower_d[...,self.padding[0]:-self.padding[0],
                                   self.padding[1]:-self.padding[1]]
+
+            # why only look for padding[0] in upper_d???    
+            if self.padding[0] > 0:
+                upper_d = upper_d[...,self.padding[0]:-self.padding[0],
+                                  self.padding[0]:-self.padding[0]]
 
 
         def _bound_oneside(last_A, d_pos, d_neg, b_pos, b_neg):
@@ -422,6 +529,24 @@ class BoundMaxPool(BoundOptimizableActivation):
             if isinstance(last_A, torch.Tensor):
                 pos_A = last_A.clamp(min=0)
                 neg_A = last_A.clamp(max=0)
+
+                # TODO: introduces bugs in the original abCROWN, if patches are used
+                #if b_pos is not None:
+                #    # check if both the slopes and the bias have a spec dimension
+                #    # if we use the original abCROWN overapproximation, they use the same biases
+                #    # for each spec output, so the biases don't have a spec dimension
+                #    if len(d_pos.shape) == 5 and len(b_pos.shape) == 5:
+                #        # with our formulation, we can have different biases for the maxpool neuron for each spec
+                #        # but still need spec x batch shape in the output bias
+                #        bias = bias + torch.einsum('sb...,sb...->sb', pos_A, b_pos)
+                #    else:
+                #        # just use the bias computation that was there before otherwise
+                #        bias = bias + self.get_bias(pos_A, b_pos)
+                #if b_neg is not None:
+                #    if len(d_neg.shape) == 5 and len(b_neg.shape) == 5:
+                #        bias = bias + torch.einsum('sb...,sb...->sb', neg_A, b_neg)
+                #    else:
+                #        bias = bias + self.get_bias(neg_A, b_neg)
 
                 if b_pos is not None:
                     # This is matrix mode, and padding is considered in the previous layers
@@ -548,10 +673,6 @@ class BoundMaxPool(BoundOptimizableActivation):
                     inserted_zeros=last_A.inserted_zeros, output_padding=output_padding)
 
             return next_A, bias
-
-        if self.padding[0] > 0:
-            upper_d = upper_d[...,self.padding[0]:-self.padding[0],
-                              self.padding[0]:-self.padding[0]]
 
         uA, ubias = _bound_oneside(last_uA, upper_d, lower_d, upper_b, lower_b)
         lA, lbias = _bound_oneside(last_lA, lower_d, upper_d, lower_b, upper_b)
